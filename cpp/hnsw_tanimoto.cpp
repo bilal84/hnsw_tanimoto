@@ -25,6 +25,20 @@
 
 
 
+bool compare_pairs(const std::pair<double, int>& a, const std::pair<double, int>& b) {
+    return a.first < b.first;
+}
+
+struct pair_hash {
+    std::size_t operator() (const std::pair<int, int>& pair) const {
+        return std::hash<int>()(pair.first) ^ std::hash<int>()(pair.second);
+    }
+};
+
+
+constexpr size_t NEW_FPS_BITS = 128;
+
+
 using namespace std;
 
 constexpr size_t BITSET_SIZE = 2048;
@@ -37,12 +51,31 @@ double tanimoto_similarity(const Fingerprint& fp1, const Fingerprint& fp2) {
     return static_cast<double>(common_bits) / total_bits;
 }
 
+struct MinHeapComp {
+    bool operator()(const std::tuple<double, int, bool>& a, const std::tuple<double, int, bool>& b) const {
+        return std::get<0>(a) < std::get<0>(b);
+    }
+};
+
+struct MinHeapCompPair {
+    bool operator()(const std::pair<double, int>& a, const std::pair<double, int>& b) const {
+        return std::get<0>(a) < std::get<0>(b);
+    }
+};
+
+struct MaxHeapCompPair {
+    bool operator()(const std::pair<double, int>& a, const std::pair<double, int>& b) const {
+        return std::get<0>(a) > std::get<0>(b);
+    }
+};
+
+
 class HNSW {
 public:
     std::vector<double> time;
 
-    HNSW(int K, int efConstruction, float mL, const std::string& filename)
-        : K(K), efConstruction(efConstruction), mL(mL), enter_point(-1), top_layer(-1) {
+    HNSW(int M, int Mmax, int efConstruction, float mL, const std::string& filename)
+        : M(M), Mmax(Mmax), efConstruction(efConstruction), mL(mL), enter_point(-1), top_layer(-1) {
 
         layer = 0;
         
@@ -54,6 +87,14 @@ public:
             return;
         }
 
+        std::vector<size_t> permutation(BITSET_SIZE);
+        std::iota(permutation.begin(), permutation.end(), 0);
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(permutation.begin(), permutation.end(), g);
+
+        size_t chunk_size = BITSET_SIZE / NEW_FPS_BITS;
+
         std::string line;
         while (std::getline(file, line)) {
             Fingerprint bs;
@@ -62,66 +103,207 @@ public:
                     bs.set(idx);
                 }
             }
-            fps.push_back(bs);
+
+            std::vector<char> new_fp;
+            for (size_t i = 0; i < BITSET_SIZE; i += chunk_size) {
+                char value = -1;
+                for (size_t j = 0; j < chunk_size; ++j) {
+                    if (bs[permutation[i + j]]) {
+                        value = j;
+                        break;
+                    }
+                }
+                new_fp.push_back(value);
+            }
+            new_fps.push_back(new_fp);
         }
 
         layers.resize(100);
         time.resize(19, 0.0);
     }
 
-    void print_structure() const {
-        for (size_t layer = 0; layer < layers.size(); ++layer) {
-            if (layers[layer].empty()) continue;
-            std::cout << "Layer " << layer << ":\n";
-            for (const auto& element : layers[layer]) {
-                std::cout << "  Node " << element.first << ": Neighbors: ";
-                for (const auto& neighbor : element.second) {
-                    double priority;
-                    int node;
-                    bool flag;
-                    std::tie(priority, node, flag) = neighbor;
-                    std::cout << "(" << priority << ", " << node << ", " << flag << ") ";
-                }
-                std::cout << "\n";
-            }
-        }
-    }
-
-
-
-
-    void insert_list(const std::vector<int>& L) {
+    void process_entry(const std::vector<int>& sublist, int i) {
         auto start = std::chrono::high_resolution_clock::now();
 
         std::default_random_engine generator;
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
 
-        for (int q : L) {
-            int l = static_cast<int>(-log(distribution(generator)) * mL);
-            if (enter_point == -1) {
-                enter_point = q;
-                top_layer = l;
+        int q = sublist[i];
+
+        int l = static_cast<int>(-log(distribution(generator)) * mL);
+        int L = top_layer;
+        int ep = enter_point;
+
+        for (int lc = L; lc > l; --lc) {
+            auto W = search_layer(q, {ep}, 1, lc);
+            ep = W[0];
+        }
+
+        std::vector<int> ep_vec = {ep};
+        for (int lc = std::min(L, l); lc >= 0; --lc) {
+            auto W = search_layer(q, ep_vec, 30, lc);
+            if (lc == 0){
+                auto W2 = find_closest_elements(sublist, i);
+
+                for (int e : W2){
+                    W.push_back(e);
+                }
             }
-            for (int lc = 0; lc <= l; ++lc) {
-                std::vector<std::tuple<double, int, bool>> empty_heap;
-                layers[lc][q] = empty_heap;
+
+            auto neighbors = select_neighbors(q, W, M, lc);
+
+            {
+                std::lock_guard<std::mutex> lock(insert_mutex);
+
+                layers[lc][q] = {};
+
+                dict[{lc, q}] = neighbors;
             }
-            if (l > top_layer) {
-                enter_point = q;
-                top_layer = l;
+
+            // for (int e : neighbors) {
+            //     auto eConn = neighborhood(e, lc);
+            //     if (eConn.size() > Mmax) {
+            //         auto eNewConn = select_neighbors(e, eConn, Mmax, lc);
+            //         set_neighborhood(e, eNewConn, lc);
+            //         for (int neighbor : eConn) {
+            //             if (std::find(eNewConn.begin(), eNewConn.end(), neighbor) == eNewConn.end()) {
+            //                 layers[lc][neighbor].erase(e);
+            //             }
+            //         }
+            //     }
+            // }
+
+            ep_vec = {};
+            for (int e : W){
+                ep_vec.push_back(e);
             }
         }
 
-        for (int l = 0; l < layers.size(); ++l) {
-            layer = l;
-            auto B = layers[l];
-            layers[l] = nn_descent_full(B, K, l);
+        {
+            std::lock_guard<std::mutex> lock(insert_mutex);
+
+            for (int lc = L; lc > l; --lc) {
+                layers[lc][q] = {};
+            }
+
+            if (l > L) {
+                enter_point = q;
+                top_layer = l;
+            }
         }
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
-        this->time[0] += elapsed.count();
+        this->time[9] += elapsed.count();
+
     }
+
+
+    void insert_list_parallel(const std::vector<int>& sublist) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        constexpr size_t MAX_THREADS = 10000;
+        std::vector<std::future<void>> futures;
+
+        dict.clear();
+
+        for (size_t i = 0; i < sublist.size(); ++i) {
+            if (futures.size() >= MAX_THREADS) {
+                for (auto& fut : futures) {
+                    fut.wait();
+                }
+                futures.clear();
+            }
+            futures.push_back(std::async(std::launch::async, &HNSW::process_entry, this, std::ref(sublist), i));
+        }
+        for (auto& fut : futures) {
+            fut.wait();
+        }
+
+        for (const auto& pair : dict) {
+            add_connections(pair.first.second, pair.second, pair.first.first);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        this->time[10] += elapsed.count();
+    }
+
+    void insert_list(const std::vector<int>& L) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        if (!L.empty()) {
+            insert(L[0]);
+        }
+
+        size_t batch_size = 100;
+        for (size_t i = 1; i < L.size(); i += batch_size) {
+            std::vector<int> sublist(L.begin() + i, L.begin() + std::min(L.size(), i + batch_size));
+
+            std::cout << "test" << std::endl;
+            
+            insert_list_parallel(sublist);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        this->time[0] += elapsed.count(); 
+    }
+
+
+
+    void insert(int q) {
+        std::default_random_engine generator;
+        std::uniform_real_distribution<double> distribution(0.0, 1.0);
+
+        int l = static_cast<int>(-log(distribution(generator)) * mL);
+        int L = top_layer;
+        int ep = enter_point;
+
+        for (int lc = 0; lc <= l; ++lc) {
+            layers[lc][q] = {};
+        }
+
+        if (enter_point == -1) {
+            enter_point = q;
+            top_layer = l;
+            return;
+        }
+
+        for (int lc = L; lc > l; --lc) {
+            auto W = search_layer(q, {ep}, 1, lc);
+            ep = W[0];
+        }
+
+        std::vector<int> ep_vec = {ep};
+        for (int lc = std::min(L, l); lc >= 0; --lc) {
+            auto W = search_layer(q, ep_vec, efConstruction, lc);
+
+            auto neighbors = select_neighbors(q, W, M, lc);
+            add_connections(q, neighbors, lc);
+
+            for (int e : neighbors) {
+                auto eConn = neighborhood(e, lc);
+                if (eConn.size() > Mmax) {
+                    auto eNewConn = select_neighbors(e, eConn, Mmax, lc);
+                    set_neighborhood(e, eNewConn, lc);
+                    for (int neighbor : eConn) {
+                        if (std::find(eNewConn.begin(), eNewConn.end(), neighbor) == eNewConn.end()) {
+                            layers[lc][neighbor].erase(e);
+                        }
+                    }
+                }
+            }
+            ep_vec = W;
+        }
+
+        if (l > L) {
+            enter_point = q;
+            top_layer = l;
+        }
+    }
+
+
 
 
     std::set<int> k_nn_search(int q, int K, int ef) {
@@ -132,14 +314,14 @@ public:
         int L = top_layer;
         
         for (int lc = L; lc > 0; --lc) {
-            W = searchLayer(q, {ep}, 1, lc);
+            W = search_layer(q, {ep}, 1, lc);
             ep = W[0];
         }
 
-        W = searchLayer(q, {ep}, ef, 0);
+        W = search_layer(q, {ep}, ef, 0);
 
         std::sort(W.begin(), W.end(), [this, q](int a, int b) {
-            return distance(a, q) < distance(b, q);
+            return new_fps_distance(a, q) < new_fps_distance(b, q);
         });
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -152,6 +334,7 @@ public:
 
         return result;
     }
+
 
     double distance(int u1, int u2) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -167,338 +350,145 @@ public:
 
 private:
     int M;
+    int Mmax;
     int efConstruction;
     float mL;
-    std::vector<std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>> layers;
+    std::vector<std::unordered_map<int, std::unordered_set<int>>> layers;
     int enter_point;
-    int top_layer;
+    int top_layer = 0;
     std::vector<Fingerprint> fps;
-    std::unordered_map<int, std::vector<std::pair<double, int>>> old, new_map;
-    std::unordered_map<int, std::vector<std::pair<double, int>>> oldp, newp;
+    std::unordered_map<int, std::unordered_set<int>> old, new_map;
+    std::unordered_map<int, std::unordered_set<int>> oldp, newp;
     int layer;
-    int K;
+
+    std::unordered_map<std::pair<int, int>, std::vector<int>, pair_hash> dict;
+
+    std::vector<std::vector<char>> new_fps;
 
     std::mutex counter_mutex;
     std::mutex new_map_mutex;
     std::mutex old_map_mutex;
     std::mutex v_mutex;
-    std::mutex index_mutex;
+    std::mutex affiche;
+    std::mutex insert_mutex;
 
 
-    void process_entry(std::pair<const int, std::vector<std::tuple<double, int, bool>>>& v,
-                   int rho) {
-        auto start = std::chrono::high_resolution_clock::now();
-        {
-            for (const auto& item : v.second) {
-                double d; int u; bool flag;
-                std::tie(d, u, flag) = item;
-                if (!flag) {
-                    std::lock_guard<std::mutex> lock(old_map_mutex);
-                    old[v.first].emplace_back(d, u);
+    void generate_new_fingerprints(const std::vector<Fingerprint>& fps) {
+        std::vector<size_t> permutation(BITSET_SIZE);
+        std::iota(permutation.begin(), permutation.end(), 0);
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(permutation.begin(), permutation.end(), g);
+
+        size_t chunk_size = BITSET_SIZE / NEW_FPS_BITS;
+
+        for (const auto& bs : fps) {
+            std::vector<char> new_fp;
+            for (size_t i = 0; i < BITSET_SIZE; i += chunk_size) {
+                char value = -1;
+                for (size_t j = 0; j < chunk_size; ++j) {
+                    if (bs[permutation[i + j]]) {
+                        value = j;
+                        break;
+                    }
                 }
+                new_fp.push_back(value);
             }
+            new_fps.push_back(new_fp);
         }
-
-        std::vector<std::pair<double, int>> sampled;
-        {
-            std::lock_guard<std::mutex> lock(new_map_mutex);
-            sampled = sample_full2(new_map[v.first], static_cast<int>(rho * K));
-            new_map[v.first] = sampled;
-        }
-
-        std::unordered_set<int> sampledSet;
-        for (const auto& pair : sampled) {
-            sampledSet.insert(pair.second);
-        }
-
-        for (auto& item : v.second) {
-            int id = std::get<1>(item);
-            if (sampledSet.find(id) != sampledSet.end()) {
-                std::get<2>(item) = false;
-            }
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[13] += elapsed.count();
     }
 
-    void parallel_for(std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& B, 
-                      int rho) {
+    double new_fps_distance(size_t fp1_index, size_t fp2_index) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        constexpr size_t MAX_THREADS = 10000;
-        std::vector<std::future<void>> futures;
+        const std::vector<char>& new_fp1 = new_fps[fp1_index];
+        const std::vector<char>& new_fp2 = new_fps[fp2_index];
 
-        for (auto& v : B) {
-            if (futures.size() >= MAX_THREADS) {
-                for (auto& fut : futures) {
-                    fut.wait();
-                }
-                futures.clear();
-            }
-            futures.push_back(std::async(std::launch::async, &HNSW::process_entry, this, std::ref(v), rho));
+        int common_indices = 0;
+        int common_negative = 0;
+
+        for (size_t i = 0; i < new_fp1.size(); ++i) {
+            int fp1_val = new_fp1[i], fp2_val = new_fp2[i];
+            bool valid_indices = (fp1_val != -1 && fp2_val != -1);
+            common_indices += (valid_indices && fp1_val == fp2_val);
+            common_negative += (fp1_val == -1 && fp2_val == -1);
         }
 
-        for (auto& fut : futures) {
-            fut.wait();
-        }
+        int adjusted_fps_bits = new_fp1.size() - common_negative;
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
-        this->time[14] += elapsed.count();
+        this->time[2] += elapsed.count();
+
+        return adjusted_fps_bits ? 1.0 - static_cast<double>(common_indices) / adjusted_fps_bits : 1.0;
     }
 
-
-
-    void process_entry2(
-    const std::pair<const int, std::vector<std::tuple<double, int, bool>>>& v, 
-    std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& B,
-    int rho, int layer, int& counter) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        std::vector<int> oldp_keys;
-        if (oldp.find(v.first) != oldp.end()) {
-            for (const auto& pair : oldp[v.first]) {
-                oldp_keys.push_back(pair.second);
-            }
-        }
-        {
-            std::vector<std::pair<double, int>> old_samples = sample(oldp_keys, static_cast<int>(rho * K), -1);
-            std::lock_guard<std::mutex> old_lock(old_map_mutex);
-            old[v.first] = merge_heaps_full(old[v.first], old_samples);
-            std::make_heap(old[v.first].begin(), old[v.first].end());
-        }
-
-        std::vector<int> newp_keys;
-        if (newp.find(v.first) != newp.end()) {
-            for (const auto& pair : newp[v.first]) {
-                newp_keys.push_back(pair.second);
-            }
-        }
-        {
-            std::vector<std::pair<double, int>> new_samples = sample(newp_keys, static_cast<int>(rho * K), -1);
-            std::lock_guard<std::mutex> new_lock(new_map_mutex);
-            new_map[v.first] = merge_heaps_full(new_map[v.first], new_samples);
-            std::make_heap(new_map[v.first].begin(), new_map[v.first].end());
-        }
-
-        for (const auto& [d1, u1] : new_map[v.first]) {
-            for (const auto& [d2, u2] : new_map[v.first]) {
-                if (u1 < u2) {
-                    double l = distance(u1, u2);
-                    std::lock_guard<std::mutex> counter_lock(counter_mutex);
-                    counter += update_nn_full(B[u1], std::make_tuple(l, u2, true), layer, u1, K);
-                    counter += update_nn_full(B[u2], std::make_tuple(l, u1, true), layer, u2, K);
-                }
-            }
-            for (const auto& [d2, u2] : old[v.first]) {
-                if (u1 < u2) {
-                    double l = distance(u1, u2);
-                    std::lock_guard<std::mutex> counter_lock(counter_mutex);
-                    counter += update_nn_full(B[u1], std::make_tuple(l, u2, true), layer, u1, K);
-                    counter += update_nn_full(B[u2], std::make_tuple(l, u1, true), layer, u2, K);
-                }
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[15] += elapsed.count();
-    }
+    // ON VEUT DIST MIN > top pour éliminer tous ces cas
+    // common indice= min des 2, common negatives = min des 2
 
     
-    void parallel_for2(
-    std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& B,
-    int rho, int layer, int& counter,
-    int batchSize = 10000)
-    {
+
+    std::vector<int> select_neighbors(int q, const std::vector<int>& W, int M, int lc) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        std::vector<std::future<void>> futures;
-        std::vector<std::pair<const int, std::vector<std::tuple<double, int, bool>>>> items(B.begin(), B.end());
+        std::vector<std::pair<double, int>> distances;
+        for (int w : W) {
+            double dist = new_fps_distance(q, w);
+            distances.emplace_back(dist, w);
+        }
+        std::sort(distances.begin(), distances.end());
 
-        for (size_t i = 0; i < items.size(); i += batchSize) {
-            auto end = std::min(items.size(), i + batchSize);
-
-            for (size_t j = i; j < end; ++j) {
-                futures.push_back(std::async(std::launch::async, &HNSW::process_entry2, this, std::cref(items[j]),
-                                            std::ref(B), rho, layer, std::ref(counter)));
-            }
-
-            for (auto& fut : futures) {
-                fut.get();
-            }
-            futures.clear();
+        std::vector<int> neighbors;
+        for (int i = 0; i < std::min(M, static_cast<int>(distances.size())); ++i) {
+            neighbors.push_back(distances[i].second);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
-        this->time[16] += elapsed.count();
-    }
+        this->time[3] += elapsed.count();
 
-    void process_entry3(std::vector<int>& keys,
-    std::pair<const int, std::vector<std::tuple<double, int, bool>>>& v, int v_first){
-        auto start = std::chrono::high_resolution_clock::now();
-
-        auto samples = sample_full(keys, v_first);
-        std::lock_guard<std::mutex> lock(v_mutex);
-        v.second = samples;
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[17] += elapsed.count();
-
-    }
-
-    void parallel_for3(std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& B, 
-                      int rho, std::vector<int>& keys) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        constexpr size_t MAX_THREADS = 20000;
-        std::vector<std::future<void>> futures;
-
-        for (auto& v : B) {
-            if (futures.size() >= MAX_THREADS) {
-                for (auto& fut : futures) {
-                    fut.wait();
-                }
-                futures.clear();
-            }
-            int v_first = v.first;
-            futures.push_back(std::async(std::launch::async, &HNSW::process_entry3, this, std::ref(keys), std::ref(v), v_first));
-        }
-
-        for (auto& fut : futures) {
-            fut.wait();
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[18] += elapsed.count();
+        return neighbors;
     }
 
 
-
-
-    std::unordered_map<int, std::vector<std::tuple<double, int, bool>>> nn_descent_full(
-        std::unordered_map<int, std::vector<std::tuple<double, int, bool>>> B, 
-        int K, 
-        int layer) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        if (B.empty()) {
-            return B;
-        }
-
-        double delta = 0.001;
-        int rho = 5;
-
-        std::vector<int> keys = extract_keys(B);
-
-        parallel_for3(B, rho, keys);
-
-        while (true) {
-            parallel_for(B, rho);
-
-            auto oldp = reverse(old);
-            auto newp = reverse(new_map);
-            int counter = 0;
-            
-            parallel_for2(B, rho, layer, counter);
-
-            if (counter < delta * B.size() * K) {
-                auto end = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double> elapsed = end - start;
-                this->time[3] += elapsed.count();
-                return B;
-            }
-        }
-    }
-
-    std::unordered_map<int, std::set<int>> transform_heaps_to_sets_full(
-    const std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& B) 
-    {
+    void add_connections(int q, const std::vector<int>& neighbors, int lc) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        std::unordered_map<int, std::set<int>> transformed_B;
-
-        for (const auto& item : B) {
-            int q = item.first;
-            const auto& neighbors = item.second;
-            std::set<int> neighbor_set;
-            
-            for (const auto& neighbor_tuple : neighbors) {
-                double priority; int neighbor; bool flag;
-                std::tie(priority, neighbor, flag) = neighbor_tuple;
-                neighbor_set.insert(neighbor);
-            }
-
-            transformed_B[q] = neighbor_set;
+        for (int neighbor : neighbors) {
+            layers[lc][q].insert(neighbor);
+            layers[lc][neighbor].insert(q);
         }
+
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         this->time[4] += elapsed.count();
-        return transformed_B;
     }
 
-
-    std::vector<std::pair<double, int>> sample(const std::vector<int>& V, int K, int m) {
+    void set_neighborhood(int e, const std::vector<int>& new_neighbors, int lc) {
         auto start = std::chrono::high_resolution_clock::now();
-        std::vector<int> keys_without_m;
-        
-        for (const auto& key : V) {
-            if (key != m) {
-                keys_without_m.push_back(key);
-            }
+
+        layers[lc][e] = {};
+
+        for (int neighbor : new_neighbors) {
+            layers[lc][e].insert(neighbor);
         }
-        
-        std::vector<int> sampled_neighbors;
-        if (K <= keys_without_m.size()) {
-            std::unordered_set<int> selected_indices;
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(0, keys_without_m.size() - 1);
-            
-            while (selected_indices.size() < K) {
-                selected_indices.insert(dis(gen));
-            }
-            
-            for (int index : selected_indices) {
-                sampled_neighbors.push_back(keys_without_m[index]);
-            }
-        } else {
-            sampled_neighbors = keys_without_m;
-        }
-        
-        std::vector<std::pair<double, int>> heap;
-        for (const auto& neighbor : sampled_neighbors) {
-            heap.emplace_back(-std::numeric_limits<double>::infinity(), neighbor);
-        }
-        std::make_heap(heap.begin(), heap.end());
-        
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         this->time[5] += elapsed.count();
-        
-        return heap;
     }
 
-    std::unordered_map<int, std::vector<std::pair<double, int>>> reverse(
-    const std::unordered_map<int, std::vector<std::pair<double, int>>>& B) 
-    {
+
+    
+
+    std::vector<int> neighborhood(int element, int lc) {
         auto start = std::chrono::high_resolution_clock::now();
-        std::unordered_map<int, std::vector<std::pair<double, int>>> R;
 
-        for (const auto& pair : B) {
-            int u = pair.first;
-            const auto& neighbors = pair.second;
-
-            for (const auto& neighbor : neighbors) {
-                double neg_distance; int v;
-                std::tie(neg_distance, v) = neighbor;
-                if (u != v) {
-                    R[v].emplace_back(neg_distance, u);
+        std::vector<int> result;
+        if (lc <= top_layer) {
+            auto it = layers[lc].find(element);
+            if (it != layers[lc].end()) {
+                for (const auto& neighbor : it->second) {
+                    result.push_back(neighbor);
                 }
             }
         }
@@ -507,200 +497,20 @@ private:
         std::chrono::duration<double> elapsed = end - start;
         this->time[6] += elapsed.count();
 
-        return R;
-    }
-
-
-    std::vector<int> extract_keys(const std::unordered_map<int, std::vector<std::tuple<double, int, bool>>>& V) {
-        std::vector<int> keys;
-        keys.reserve(V.size());
-        for (const auto& item : V) {
-            keys.push_back(item.first);
-        }
-        return keys;
-    }
-
-
-    std::vector<std::tuple<double, int, bool>> sample_full(
-    std::vector<int>& keys,
-    int m) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        std::unordered_set<int> sampled_neighbors;
-        std::vector<std::tuple<double, int, bool>> heap;
-
-        if (K < keys.size() - 1) {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(0, keys.size() - 1);
-
-            while (sampled_neighbors.size() < K) {
-                int idx = dis(gen);
-                if (keys[idx] != m) {
-                    heap.emplace_back(std::numeric_limits<double>::infinity(), keys[idx], true);
-                    sampled_neighbors.insert(keys[idx]);
-                }
-            }
-        } else {
-            for (int elem : keys) {
-                if (elem != m) {
-                    heap.emplace_back(std::numeric_limits<double>::infinity(), elem, true);
-                }
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto elapsed = end - start;
-
-        this->time[7] += elapsed.count();
-
-        return heap;
-    }
-
-
-    std::vector<std::pair<double, int>> sample_full2(
-        const std::vector<std::pair<double, int>>& V,
-        int K) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        std::vector<std::pair<double, int>> keys_without_m = V;
-
-        std::vector<std::pair<double, int>> sampled_neighbors;
-        if (K <= keys_without_m.size()) {
-            std::unordered_set<int> selected_indices;
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(0, keys_without_m.size() - 1);
-
-            while (selected_indices.size() < K) {
-                selected_indices.insert(dis(gen));
-            }
-
-            for (int index : selected_indices) {
-                sampled_neighbors.push_back(keys_without_m[index]);
-            }
-        } else {
-            sampled_neighbors = keys_without_m;
-        }
-
-        std::vector<std::pair<double, int>> heap;
-        for (const auto& neighbor : sampled_neighbors) {
-            heap.emplace_back(neighbor.first, neighbor.second);
-        }
-        std::make_heap(heap.begin(), heap.end());
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[8] += elapsed.count();
-
-        return heap;
-    }
-
-    int update_nn_full(
-    std::vector<std::tuple<double, int, bool>>& heap,
-    const std::tuple<double, int, bool>& neighbor_with_neg_dist,
-    int l,
-    int v,
-    int Mmax) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        double neg_distance;
-        int neighbor;
-        bool b;
-        std::tie(neg_distance, neighbor, b) = neighbor_with_neg_dist;
-
-        bool found = false; 
-
-        for (auto it = heap.begin(); it != heap.end(); ) {
-            if (std::get<1>(*it) == neighbor && std::isinf(std::get<0>(*it))) {
-                it = heap.erase(it); 
-                found = true;
-                std::make_heap(heap.begin(), heap.end()); 
-                heap.push_back(neighbor_with_neg_dist);
-                std::push_heap(heap.begin(), heap.end());
-                auto end = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double> elapsed = end - start;
-                this->time[9] += elapsed.count();
-                return 1;
-            } else {
-                ++it;
-            }
-        }
-        
-        if (!found) {
-            if (neg_distance < std::get<0>(heap.front())) {
-                std::pop_heap(heap.begin(), heap.end());
-                int removed_neighbor = std::get<1>(heap.back());
-                heap.pop_back();
-                heap.push_back(std::make_tuple(neg_distance, neighbor, true));
-                std::push_heap(heap.begin(), heap.end());
-
-                auto end = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double> elapsed = end - start;
-                this->time[9] += elapsed.count();
-                return 1;
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[9] += elapsed.count();
-        return 0;
-    }
-
-
-    std::vector<std::pair<double, int>> merge_heaps_full(
-    const std::vector<std::pair<double, int>>& B,
-    const std::vector<std::pair<double, int>>& R) 
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        std::vector<std::pair<double, int>> merged_list = B;
-        std::make_heap(merged_list.begin(), merged_list.end());
-
-        for (const auto& item : R) {
-            merged_list.push_back(item);
-            std::push_heap(merged_list.begin(), merged_list.end());
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[10] += elapsed.count();
-        return merged_list;
-    }
-
-    std::unordered_set<int> neighborhood(int element, int lc) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        std::unordered_set<int> result;
-        if (lc < top_layer) {
-            auto it = layers[lc].find(element);
-            if (it != layers[lc].end()) {
-                for (const auto& neighbor_tuple : it->second) {
-                    int neighbor;
-                    std::tie(std::ignore, neighbor, std::ignore) = neighbor_tuple;
-                    result.insert(neighbor);
-                }
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        this->time[11] += elapsed.count();
-
         return result;
     }
 
-    std::vector<int> searchLayer(int q, const std::vector<int>& ep, int ef, int lc) {
+
+    std::vector<int> search_layer(int q, const std::vector<int>& ep, int ef, int lc) {
         auto start = std::chrono::high_resolution_clock::now();
 
         std::unordered_set<int> visited;
-        std::priority_queue<std::pair<double, int>> C; 
+        std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>, std::greater<>> C;
         std::priority_queue<std::pair<double, int>> W;
 
         for (int e : ep) {
-            double distance_e_q = distance(e, q);
-            C.emplace(-distance_e_q, e);
+            double distance_e_q = new_fps_distance(e, q);
+            C.emplace(distance_e_q, e);
             W.emplace(distance_e_q, e);
             visited.insert(e);
         }
@@ -708,44 +518,71 @@ private:
         while (!C.empty()) {
             auto [c_dist, c_elem] = C.top();
             C.pop();
-            if (W.top().first < -c_dist) {
+            if (W.top().first < c_dist) {
                 break;
             }
 
             for (int e : neighborhood(c_elem, lc)) {
                 if (visited.find(e) == visited.end()) {
-                    double distance_e_q = distance(e, q);
+                    double distance_e_q = new_fps_distance(e, q);
                     visited.insert(e);
 
                     if (W.size() < ef || distance_e_q < W.top().first) {
-                        if (distance_e_q != 0) {
-                            C.emplace(-distance_e_q, e);
-                            W.emplace(distance_e_q, e);
-                            if (W.size() > ef) {
-                                W.pop();
-                            }
+                        C.emplace(distance_e_q, e);
+                        W.emplace(distance_e_q, e);
+                        if (W.size() > ef) {
+                            W.pop();
                         }
                     }
                 }
             }
         }
 
-        std::vector<int> result;
-        while (!W.empty() && result.size() < ef) {
-            result.push_back(W.top().second);
+        while (W.size()>ef) {
             W.pop();
+        }
+
+        std::vector<int> result;
+        int top;
+        while (W.size()>0) {
+            top = W.top().second;
+            W.pop();
+            result.push_back(top);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
+        this->time[7] += elapsed.count();
 
         return result;
     }
 
 
+    std::vector<int> find_closest_elements(const std::vector<int>& sublist, int i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        std::vector<std::pair<double, int>> diffs;
+
+        for (int j = 0; j < i; ++j) {
+            double dist = new_fps_distance(sublist[j], sublist[i]);
+            diffs.push_back({dist, j});
+        }
+
+        std::sort(diffs.begin(), diffs.end(), compare_pairs);
+
+        std::vector<int> closest_elements;
+        for (int k = 0; k < std::min(10, static_cast<int>(diffs.size())); ++k) {
+            closest_elements.push_back(sublist[diffs[k].second]);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        this->time[8] += elapsed.count();
+
+        return closest_elements;
+    }
 
 };
-
 
 
 
@@ -753,11 +590,10 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(hnsw_tanimoto, m) {
     py::class_<HNSW>(m, "HNSW")
-        .def(py::init<int, int, float, const std::string&>(),
-             py::arg("K"), py::arg("efConstruction"), py::arg("mL"), py::arg("filename"))
+        .def(py::init<int, int, int, float, const std::string&>(),
+             py::arg("M"), py::arg("Mmax"), py::arg("efConstruction"), py::arg("mL"), py::arg("filename"))
         .def("insert_list", &HNSW::insert_list, py::arg("indices"))
         .def("k_nn_search", &HNSW::k_nn_search, py::arg("index"), py::arg("K"), py::arg("efConstruction"))
         .def("distance", &HNSW::distance, py::arg("idx1"), py::arg("idx2"))
-        .def("print_structure", &HNSW::print_structure)
         .def_readwrite("time", &HNSW::time);
 }

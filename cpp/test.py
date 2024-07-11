@@ -50,6 +50,14 @@ def load_fingerprints(file_path):
 def main(active_file, inactive_file, output_file):
     N = 50
 
+    point = 0
+
+    M = 15
+    MMax= 2*M
+    efConstruction = 150
+    mL = 1 / np.log2(M)
+
+
     print("WITHOUT HNSW")
     print("Loading active molecules...")
     active_fps = load_fingerprints(active_file)
@@ -59,7 +67,7 @@ def main(active_file, inactive_file, output_file):
     print("Calculating nearest neighbors without HNSW...")
     search_nohnsw = NOHNSW(fps)
     start_time_nohnsw = time()
-    neighbors_nohnsw = search_nohnsw.k_nearest_neighbors(0, N)
+    neighbors_nohnsw = search_nohnsw.k_nearest_neighbors(point, N)
     end_time_nohnsw = time()
     time_nohnsw = end_time_nohnsw - start_time_nohnsw
     print(f"Time taken without HNSW: {time_nohnsw} seconds")
@@ -79,20 +87,14 @@ def main(active_file, inactive_file, output_file):
     total_fps = count_active + count_inactive
     print(f"Total fingerprints saved: {total_fps}")
 
-    M = 5
-    #K = int(0.01 * total_fps)
-    K = 400
-    efConstruction = 800
-    mL = 1 / np.log2(M)
-
-    hnsw = HNSW(K, efConstruction, mL, output_file)
+    hnsw = HNSW(M, MMax, efConstruction, mL, output_file)
 
     print("Starting to insert elements into HNSW...")
     hnsw.insert_list([i for i in range(total_fps)])
 
     print("Calculating nearest neighbors with HNSW...")
     start_time_hnsw = time()
-    neighbors_hnsw = hnsw.k_nn_search(0, N, efConstruction)
+    neighbors_hnsw = hnsw.k_nn_search(point, N, efConstruction)
     end_time_hnsw = time()
     time_hnsw = end_time_hnsw - start_time_hnsw
     print(f"Time taken with HNSW: {time_hnsw} seconds")
@@ -107,22 +109,14 @@ def main(active_file, inactive_file, output_file):
     print("insert_list :" + str(hnsw.time[0]))
     print("k_nn_search :" + str(hnsw.time[1]))
     print("distance :" + str(hnsw.time[2]))
-    print("nn_descent_full :" + str(hnsw.time[3]))
-    print("transform_heaps_to_sets_full :" + str(hnsw.time[4]))
-    print("sample :" + str(hnsw.time[5]))
-    print("reverse :" + str(hnsw.time[6]))
-    print("sample_full :" + str(hnsw.time[7]) + " (parallel)")
-    print("sample_full2 :" + str(hnsw.time[8]))
-    print("update_nn_full :" + str(hnsw.time[9]))
-    print("merge_heaps_full :" + str(hnsw.time[10]))
-    print("neighborhood :" + str(hnsw.time[11]))
-    print("searchLayer :" + str(hnsw.time[12]))
-    print("process_entry :" + str(hnsw.time[13]) + " (parallel)")
-    print("parallel_for :" + str(hnsw.time[14]))
-    print("process_entry2 :" + str(hnsw.time[15]) + " (parallel)")
-    print("parallel_for2 :" + str(hnsw.time[16]))
-    print("process_entry3 :" + str(hnsw.time[17]) + " (parallel)")
-    print("parallel_for3 :" + str(hnsw.time[18]))
+    print("select_neighbors :" + str(hnsw.time[3]))
+    print("add_connections :" + str(hnsw.time[4]))
+    print("set_neighborhood :" + str(hnsw.time[5]))
+    print("neighborhood :" + str(hnsw.time[6]))
+    print("search_layer :" + str(hnsw.time[7]))
+    print("find_closest_elements :" + str(hnsw.time[8]))
+    print("process_entry :" + str(hnsw.time[9]))
+    print("insert_list_parallel :" + str(hnsw.time[10]))
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
