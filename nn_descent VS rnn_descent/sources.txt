@@ -1,2 +1,0 @@
-rnn_descent : https://github.com/mti-lab/rnn-descent
-nn_descent : https://github.com/TatsuyaShirakawa/nndescent
