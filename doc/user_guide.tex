@@ -1,0 +1,205 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+
+\begin{document}
+
+
+\begin{algorithm}[H]
+\caption{INSERT}
+\KwIn{multilayer graph \textit{hnsw}, new element \textit{q}, normalization factor for level generation \textit{mL}}
+\KwOut{update \textit{hnsw} inserting element \textit{q} without connections}
+$l \leftarrow \left\lfloor -\ln(\text{uniform}(0 .. 1)) \cdot mL \right\rfloor$ // new element’s level\\
+$L \leftarrow$ top layer of \textit{hnsw}\\
+$ep \leftarrow$ enter point of \textit{hnsw}\\
+
+\For{$lc \leftarrow 0$ \KwTo $l$}{
+    add $q$ to layer $lc$ in \textit{hnsw}\\
+}
+
+// case of the first element inserted\\
+\If{enter point of \textit{hnsw} = -1}{
+    set enter point of \textit{hnsw} to $q$\\
+    set top layer of \textit{hnsw} to $l$\\
+    \Return\;
+}
+
+// when inserting an element with a higher maximum layer\\ 
+\If{$l > L$}{
+    set enter point of \textit{hnsw} to $q$\\
+    set top layer of \textit{hnsw} to $l$\\
+}
+\end{algorithm}
+
+
+\begin{algorithm}[H]
+\caption{INSERT-LIST}
+\KwIn{multilayer graph \textit{hnsw}, list of new elements \textit{V}, maximum number of connections for each element per layer \textit{M\_max}, RNN parameters $L, S, T1, T2$, fingerprints \textit{fps}}
+\KwOut{update \textit{hnsw} inserting elements \textit{V}}
+\For{each element $v$ in $V$}{
+    insert($v$) // insert the element without connections\\
+}
+\For{$lc \leftarrow$ top layer \KwTo 0}{
+    $ntotal \leftarrow$ number of elements in layer $lc$\\
+    // naive connection method \\
+    \If{$ntotal < 30$}{
+    connect each element to all others except itself\\
+} \Else{
+    $rnn \leftarrow$ RNN-Descent($L, S, T1, T2, fps$)\\
+    copy the results from $rnn$ to $hnsw$ at the layer $lc$\\
+    delete $rnn$\\
+}
+
+}
+\end{algorithm}
+
+
+
+
+
+
+
+
+
+\begin{algorithm}[H]
+\caption{K-NN-SEARCH}
+\KwIn{multilayer graph $hnsw$, query element $q$, number of nearest neighbors to return $K$, size of the dynamic candidate list $ef$ in \textit{hnsw}}
+\KwOut{$K$ nearest elements to $q$}
+$W \leftarrow \emptyset$ // set for the current nearest elements\\
+$ep \leftarrow$ get enter point for $hnsw$\\
+$L \leftarrow$ level of $ep$ // top layer for $hnsw$\\
+\For{$l \leftarrow L$ \KwTo $1$}{
+    $W \leftarrow$ SEARCH-LAYER($q$, $ep$, $\textit{ef}$, $l$)\\
+    $ep \leftarrow$ get nearest element from $W$ to $q\\
+}
+$W \leftarrow$ SEARCH-LAYER($q$, $ep$, $ef$, $l=0$)\\
+\Return $K$ nearest elements from $W$ to $q$
+\end{algorithm}
+
+
+
+
+
+\begin{algorithm}[H]
+\caption{SEARCH-LAYER}
+\KwIn{multilayer graph \textit{hnsw}, query element $q$, enter points $ep$, number of nearest to $q$ elements to return $ef$, layer number $l$}
+\KwOut{$ef$ closest neighbors to $q$ in \textit{hnsw}}
+$v \leftarrow ep$ // set of visited elements\\
+$C \leftarrow ep$ // set of candidates\\
+$W \leftarrow ep$ // dynamic list of found nearest neighbors\\
+\While{$|C| > 0$}{
+    $c \leftarrow$ extract nearest element from $C$ to $q$\\
+    $f \leftarrow$ get furthest element from $W$ to $q$\\
+    \If{$\text{distance}(c, q) > \text{distance}(f, q)$}{
+        \textbf{break} // all elements in $W$ are evaluated\\
+    }
+    \For{each $e$ in neighborhood($c$) at layer $l$}{
+        // update $C$ and $W$\\
+        \If{$e \notin v$}{
+            $v \leftarrow v \cup e$\\
+            $f \leftarrow$ get furthest element from $W$ to $q$\\
+            \If{$\text{distance}(e, q) < \text{distance}(f, q)$ \textbf{or} $|W| < ef$}{
+                $C \leftarrow C \cup e$\\
+                $W \leftarrow W \cup e$\\
+                \If{$|W| > ef$}{
+                    remove furthest element from $W$ to $q$\\
+                }
+            }
+        }
+    }
+}
+\Return $W$
+\end{algorithm}
+
+
+
+
+
+
+
+
+
+
+
+
+\begin{algorithm}[H]
+\caption{RNN-Descent(L, S, T1, T2, fps)}
+\KwIn{$L, S, T1, T2 \in \mathbb{Z}$, fingerprints \textit{fps}}
+\KwOut{graph $G = (V, E)$}
+$G \leftarrow \text{random graph with \textit{fps} and with a max of S neighbors per node}$\\
+initialize all flags to ``new''\\
+\For{$t1 = 1, \ldots, T1$}{
+    \For{$t2 = 1, \ldots, T2$}{
+        \texttt{UpdateNeighbors}(G)\\
+    }
+    \If{$t1 \ne T1$}{
+        \texttt{AddReverseEdges}(G, L)\\
+    }
+}
+\Return $G$
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{UpdateNeighbors(G)}
+\KwIn{graph $G = (V, E)$, vertex $u \in V$}
+\For{all $u \in V$}{
+    $U \leftarrow \{v \mid (v, u) \in E\}$\\
+    sort $v \in U$ in ascending order of $\text{distance}(u, v)$\\
+    $U' \leftarrow \emptyset$\\
+    \For{all $v \in U$}{
+        $f \leftarrow \text{true}$\\
+        \For{all $w \in U'$}{
+            \If{both flags of $v$ and $w$ are ``old''}{
+                \textbf{continue}\\
+            }
+            \If{$\text{distance}(u, w) \ge \text{distance}(u, v)$}{
+                $f \leftarrow \text{false}$\\
+                $E \leftarrow E \setminus \{(u, v)\} \cup \{(u, w)\}$\\
+                \textbf{break}\\
+            }
+        }
+        \If{$f$}{
+            $U' \leftarrow U' \cup \{v\}$\\
+        }
+    }
+    set the flag ``old'' for all vertices in $U'$\\
+}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{AddReverseEdges(G, L)}
+\KwIn{graph $G = (V, E)$, $L \in \mathbb{Z}$}
+$E \leftarrow E \cup \{(u, v) \mid (v, u) \in E\}$\\
+set flags of new neighbors to ``new''\\
+\For{all $v \in V$}{
+    $E_u \leftarrow \{(v, u) \mid (u, v) \in E\}$\\
+    remove top-L shortest edges from $E_u$\\
+    $E \leftarrow E \setminus E_u$\\
+}
+\For{all $v \in V$}{
+    $E_u \leftarrow \{(u, v) \mid (u, v) \in E\}$\\
+    remove top-L shortest edges from $E_u$\\
+    $E \leftarrow E \setminus E_u$\\
+}
+\end{algorithm}
+
+
+
+\newpage
+
+\textbf{User guide:}\\
+
+To run the program, we need to install the Pybind module (pip install pybind) and RDKit (pip install rdkit).\\
+
+The parameters that can be modified are L (the maximum number of neighbors for each node), mL (the normalization factor for level generation; the optimum value is 1/log(L)), S (the initial number of neighbors per node after random generation), T1 (the number of iterations for the outer loop in the RNNDescent algorithm) and T2 (the number of iterations for the inner loop in the RNNDescent algorithm). After a few tests, we found that L=25, S=10, T1=5 and T2=5 give very good results in terms of precision, while maintaining a good insertion time. Increasing these parameters allows us to be more precise, but it increases insertion time.\\
+
+point represents the point whose N nearest neighbors are sought. \\
+
+num\_threads represents the number of threads used during insertion. \\
+
+output\_file represents the file in which the fingerprints will be saved as a sequence of bits.
+
+
+
+\end{document}
